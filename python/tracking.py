@@ -1,5 +1,31 @@
 """
 Optimal Estimation and Particle Filtering Data Processing Pipeline
+
+This module implements a complete L0 to L1 data processing pipeline for a 
+synthetic 2D tracking problem, alongside a demonstration of Brownian Bridge 
+path sampling.
+
+Processing Levels:
+    L0 (Raw Data): Generation of synthetic ground truth state vectors and the 
+                   associated noisy sensor measurements. 
+    L1 (Processed Telemetry): Execution of Bayesian tracking filters (Kalman, SIR, 
+                              ASIR, CIR) to estimate the hidden state and 
+                              compute covariance bounds.
+
+System Assumptions & Mathematics:
+    We approximate a continuous-time stochastic process using a discrete-time sequence. 
+    In this generalized state-space framework, the state transition evaluates how the 
+    system evolves over time, denoted as X_k = F * X_{k-1} + v_{k-1}, where v_{k-1} 
+    represents multivariate Gaussian process noise. The imperfect observation model is 
+    defined as Z_k = H * X_k + n_k, where n_k represents the sensor observation noise.
+
+References:
+    1. Kalman, R. (1960). "A new approach to linear filtering and prediction problems." 
+    2. Gordon, N., Salmond, D., & Smith, A. (1993). "Novel approach to nonlinear/non-Gaussian 
+       Bayesian state estimation."
+    3. Chorin, A. J., & Tu, X. (2009). "Implicit sampling for particle filters."
+    4. Weare, J. (2009). "Particle filtering with path sampling and an application to a bimodal 
+       ocean current model."
 """
 
 import logging
@@ -28,6 +54,16 @@ logger = logging.getLogger(__name__)
 class StateSpaceModel(BaseModel):
     """
     Pydantic data model representing the physical state-space system and sensor configuration.
+    
+    Mathematical Formulation:
+        State Equation: X_k = F * X_{k-1} + v_{k-1} 
+        Observation Equation: Z_k = H * X_k + n_k
+        
+    Attributes:
+        state_transition (FloatArray): The matrix (F) defining how the state evolves.
+        observation_model (FloatArray): The matrix (H) mapping the true state to observations.
+        process_covariance (FloatArray): The matrix (Q) defining the process noise covariance.
+        sensor_covariance (FloatArray): The matrix (R) defining the sensor noise covariance.
     """
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -56,6 +92,17 @@ class TargetSimulation:
         self.n_steps = n_steps
 
     def generate_telemetry(self, initial_state: FloatArray) -> Tuple[FloatArray, FloatArray]:
+        """
+        Generates the continuous true states and the corresponding sensor measurements.
+        
+        Algorithm:
+            1. Initialize X_0 = initial_state
+            2. For each step k from 1 to n_steps:
+               a. Sample v_k ~ MultivariateNormal(0, Q)
+               b. Compute X_k = F * X_{k-1} + v_k
+               c. Sample n_k ~ MultivariateNormal(0, R)
+               d. Compute Z_k = H * X_k + n_k
+        """
         true_states = np.zeros((self.model.state_dim, self.n_steps))
         measurements = np.zeros((self.model.obs_dim, self.n_steps))
         
@@ -91,9 +138,31 @@ class BaseTrackingFilter(ABC):
 
 
 class KalmanFilter(BaseTrackingFilter):
-    """Standard linear Kalman Filter optimal estimator."""
+    """
+    Standard linear Kalman Filter optimal estimator.
+    
+    For systems characterized by strictly linear transitions and Gaussian noise profiles, 
+    the Kalman filter provides an optimal, closed-form recursive solution to estimate 
+    the internal state sequence.
+    """
     
     def run_filter(self, measurements: FloatArray, initial_state: FloatArray) -> Tuple[FloatArray, FloatArray]:
+        """
+        Runs the standard Predict-Update Kalman loop over the measurement series.
+        
+        Algorithm:
+            1. Prediction Step (Time Update):
+               Project the state ahead:     X_{k|k-1} = F * X_{k-1|k-1}
+               Project the error covar:     P_{k|k-1} = F * P_{k-1|k-1} * F^T + Q
+               
+            2. Update Step (Measurement Update):
+               Compute measurement residual: y_k = Z_k - H * X_{k|k-1}
+               Compute residual covar:       S_k = H * P_{k|k-1} * H^T + R
+               Compute Kalman Gain:          K_k = P_{k|k-1} * H^T * S_k^{-1}
+               
+               Update state estimate:        X_{k|k} = X_{k|k-1} + K_k * y_k
+               Update error covar:           P_{k|k} = (I - K_k * H) * P_{k|k-1}
+        """
         n_steps = measurements.shape[1]
         estimated_states = np.zeros((self.model.state_dim, n_steps))
         estimate_covariances = np.zeros((self.model.state_dim, self.model.state_dim, n_steps))
@@ -124,14 +193,30 @@ class KalmanFilter(BaseTrackingFilter):
 
 
 class BaseParticleFilter(BaseTrackingFilter):
-    """Intermediate class holding shared Monte Carlo systematic resampling logic."""
+    """
+    Intermediate class holding shared Monte Carlo logic such as systematic resampling.
+    
+    Particle filtering is a versatile recursive estimation method. These filters 
+    approximate the hidden states of a dynamic system by simulating numerous independent 
+    trajectories, or particles. Every simulated trajectory is assigned a likelihood 
+    weight reflecting its probability given the observed data. To prevent weight 
+    degeneracy—where a single trajectory dominates the ensemble—a systematic resampling 
+    step is applied periodically.
+    """
     
     def __init__(self, model: StateSpaceModel, n_particles: int = 100, **kwargs: Any) -> None:
         super().__init__(model)
         self.n_particles = n_particles
 
     def _resample_indices(self, weights: FloatArray) -> npt.NDArray[np.int_]:
-        """Calculates systematic resampling indices to resolve particle weight degeneracy."""
+        """
+        Calculates systematic resampling indices to resolve particle weight degeneracy.
+        
+        Algorithm (Systematic Resampling):
+            To resample, we draw a uniform random variable and step through the cumulative 
+            density function of the weights, replicating particles proportional to their 
+            likelihood mass.
+        """
         indices = np.zeros(self.n_particles, dtype=int)
         cumulative_weights = np.cumsum(weights)
         uniform_samples = np.zeros(self.n_particles)
@@ -151,6 +236,16 @@ class SIRParticleFilter(BaseParticleFilter):
     """Sampling Importance Resampling (SIR) particle filter implementation."""
     
     def run_filter(self, measurements: FloatArray, initial_state: FloatArray) -> Tuple[FloatArray, FloatArray]:
+        """
+        Algorithm:
+            1. Prior Sample (Predict): 
+               X_k^(i) = F * X_{k-1}^(i) + v_k, where v_k ~ N(0, Q)
+            2. Weight Update (Likelihood):
+               w_k^(i) = N(Z_k ; H * X_k^(i), R)
+            3. Normalize:
+               w_k^(i) = w_k^(i) / SUM(w_k)
+            4. Resample
+        """
         n_steps = measurements.shape[1]
         particles = np.zeros((self.model.state_dim, self.n_particles, n_steps))
         weights = np.zeros((self.n_particles, n_steps))
@@ -184,9 +279,27 @@ class SIRParticleFilter(BaseParticleFilter):
 
 
 class ASIRParticleFilter(BaseParticleFilter):
-    """Auxiliary Sampling Importance Resampling (ASIR) particle filter implementation."""
+    """
+    Auxiliary Sampling Importance Resampling (ASIR) particle filter implementation.
+    
+    The Auxiliary SIR algorithm enhances the standard SIR approach by leveraging the 
+    upcoming measurement during the resampling phase, before the particles are fully 
+    propagated forward in time. This pre-selection drastically improves efficiency.
+    """
 
     def run_filter(self, measurements: FloatArray, initial_state: FloatArray) -> Tuple[FloatArray, FloatArray]:
+        """
+        Algorithm:
+            Stage 1: Look-ahead Prediction & First-Stage Weights
+                mu_k^(i) = E[X_k | X_{k-1}^(i)] = F * X_{k-1}^(i)
+                lambda_k^(i) proportional to w_{k-1}^(i) * p(Z_k | mu_k^(i))
+            Stage 2: Auxiliary Resampling
+                Resample indices based on the auxiliary weights lambda_k.
+            Stage 3: Particle Propagation
+                X_k^(j) = F * X_{k-1}^(parent_j) + v_k
+            Stage 4: Final Weight Correction
+                w_k^(j) proportional to p(Z_k | X_k^(j)) / p(Z_k | mu_k^(parent_j))
+        """
         n_steps = measurements.shape[1]
         particles = np.zeros((self.model.state_dim, self.n_particles, n_steps))
         weights = np.zeros((self.n_particles, n_steps))

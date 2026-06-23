@@ -1,0 +1,363 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage[options]{mcode}
+
+\newcommand{\tr}{^\mathsf{T}}
+
+\author{Jeff Steward}
+\title{Introduction to Particle Filtering}
+\begin{document}
+\maketitle
+
+\section{Introduction to filters}
+
+A ``filter'' in this context is used to describe a mathematical process 
+that removes an unwanted component from data.  This could be thought of as 
+removing noise from data, removing some frequencies of the data (through a 
+Fourier-transform, for example), or smoothing the data.
+
+For our purposes, we will take a filter to be software that attempts 
+to remove noise from data.  We can look at this either from the perspective
+of stochastic differential equations or from a probability perspective.  In 
+this tutorial, I will attempt to show both approaches as they are equally 
+useful.
+
+\subsection{An example}
+
+We will consider the following situation.  First, suppose we have a model of how
+a system evolves that includes a random component.  For example, we could assume
+that there is a car that is driving around in a parking lot with the driver 
+constantly choosing random acceleration.  The model for this could look like:
+
+\[ \begin{array}{rcl}
+dx/dt & = & u \\
+dy/dt & = & v \\
+du/dt & = & a_x \\
+dv/dt & = & a_y
+\end{array}\] 
+
+Where $(x,y)$ is the position and $(u,v)$ are the $x$ and $y$ component of
+acceleration.  We could assume that $(a_x,a_y)$ is ``random'' - that is, it
+is changing all the time.  
+
+This description, while intuitive, is unfortunately insufficent mathematically.
+What is meant by ``changing all the time''?  We therefore use the more 
+complicated-looking stochastic differential equation model
+
+\[\begin{array}{rcl}
+dx_t & = & u_t~dt \\
+dy_t & = & v_t~dt \\
+du_t & = & a_x~dB_t \\
+dv_t & = & a_y~dB_t
+\end{array}\]
+
+Here, $\mathbf{x}_t = (x_t,y_t,u_t,v_t)\tr$ is a \emph{stochastic process}, 
+meaning that at each time $t_k$, $x_k,y_k,u_k$ and $v_k$ are random variables. 
+While a random variable is a function that maps an event to a probability,
+a stochastic process is a function that maps a time index to a random variable. 
+The $B$ here stands for Brownian motion, and $dB_t$ means that the variance of 
+the random variables $u_t$ and $v_t$ grows by an amount $a_x^2~dt$ and 
+$a_y^2~dt$ in time $dt$.
+
+To say this in a more understandable way, the SDE
+
+\[dx_t = \mu(x_t,t)dt + \sigma(x_t,t)dB_t\]
+means that in a small amount of time $\delta t$, 
+the random variable $x_{t + \delta t}$ will have changed its mean, on average,
+by $\mu(x_t,t) \delta t$ when compared to $x_t$.  To be precise, the change in 
+mean of $x_{t + \delta t}$ will be normally distributed with mean 
+$\mu(x_t,t)\delta t$ and variance $\sigma^2(x_t,t)$.  
+
+This interpretation leads us to the discrete version of the system above.  
+We discretize the equation at $N_t$ regularly spaced points in time
+$t = (0,t_f)$, and we call $(x_k^d,y_k^d,u_k^d,v_k^d)$ our 
+discrete values
+that approximate the value of $(x_k,y_k,u_k,v_k)$ at time $t_k = k \Delta t$, 
+where $\Delta t = t_f/N_t$.  From here on, we will drop the superscript $d$ on 
+the discrete variables as it is tedious to write and we are most interested in 
+the discrete case.
+
+If we approximate $dx_k = x_k - x_{k-1}$, we find
+
+\[\begin{array}{rcl}
+x_k & = & x_{k-1} + u_k \Delta t \\
+y_k & = & y_{k-1} + v_k \Delta t \\
+u_k & = & u_{k-1} + \eta_{x_k} \Delta t \\
+v_k & = & v_{k-1} + \eta_{y_k} \Delta t
+\end{array}\]  
+
+Here, 
+$\eta_{x_k}$ and $\eta_{y_k}$ are normally distributed variables with 
+mean 0 and variances of $a_x^2$ and $a_y^2$, respectively.  Since $x_k$ and 
+$y_k$ involve $u_k$ and $v_k$ from the same time step, we substitute in the 
+value for $u_k$ and $v_k$ in those expressions, giving
+
+\[\begin{array}{rcl}
+x_k & = & x_{k-1} + u_{k-1} \Delta t + \eta_{x_k} \Delta t^2\\
+y_k & = & y_{k-1} + v_{k-1} \Delta t + \eta_{y_k} \Delta t^2\\
+u_k & = & u_{k-1} + \eta_{x_k} \Delta t \\
+v_k & = & v_{k-1} + \eta_{y_k} \Delta t
+\end{array}\]  
+
+We now state our system in terms of probability.  We recall that for a normal
+distribution $X \sim \mathcal{N}(\mu, \sigma^2)$, the variable 
+$Y = aX + b \sim \mathcal{N}(a\mu + b, a^2\sigma^2)$.  Since the noise term is 
+normally distributed, we see that
+
+\[
+\begin{array}{rcl}
+x_k & \sim & \mathcal{N}(x_{k-1} + u_{k-1} \Delta t, a_{x_k}^2 \Delta t^4) \\
+y_k & \sim & \mathcal{N}(y_{k-1} + v_{k-1} \Delta t, a_{y_k}^2 \Delta t^4) \\
+u_k & \sim & \mathcal{N}(u_{k-1}, a_{x_k}^2 \Delta t^2) \\
+v_k & \sim & \mathcal{N}(v_{k-1}, a_{y_k}^2 \Delta t^2)
+\end{array}\]
+
+Since the noise terms $\eta_x$ and $\eta_y$ are now present, we cannot 
+hope to ``solve'' the system in the sense of finding ``the'' solution as we 
+can for an ordinary differential equation or a partial 
+differential equation.  Instead, we will seek the probability density of the 
+possible states at each step in time.  In order to
+find this probability density function, we could analyze the problem directly
+if the system is relatively simple, or we could discretize the problem and run 
+a numerical version of the system several times to learn from the statistics of
+our runs.  
+
+When we run the system many times, we call a collection of runs of a system 
+an ``ensemble'' and each individual run a ``member'' or, in the case of 
+particle filters, a ``particle.''  From the ensemble, we will be able to
+retrieve emperical statistics that will give us the approximate probability 
+density function of states.
+
+\subsection{Observations}
+
+We now introduce the more realistic case where instead of knowing the state 
+of the system directly, we have observations of the system that have noise
+in them.  For example, imagine that in the car problem considered above you 
+have some measurements of the $x$ and $y$ location of the car at each time
+step $k$.  The machine you are getting these observations from is not 
+perfect and the observations have some error in them.  For the sake of 
+simplicity, we wish to consider the case where the errors are normally 
+distributed.  Let's also assume we know the mean and variance of these errors.
+In reality, one would of course hope the mean was zero (i.e. the measurements 
+are unbiased) and the variance of the error is small.
+
+We want to take these observations and estimate what the state of the system
+should be.  We will use our model of the system (which we will trust is an 
+accurate depiction of the system) and the known statistics of the state change
+and observation error in order to make a prediction of the state $\mathbf{x}_k$
+at each time step $k = 1,2,\ldots,N_t$.  This prediction will depend on the 
+quality of the observations we have, i.e. on the variance of the observation 
+errors.
+
+We create a model of the observations as a function of the state, which 
+in this case is very simple.
+
+\[\begin{array}{rcl}
+z_{k_x} & = & x_k + n_{k_x} \\
+z_{k_y} & = & y_k + n_{k_y}
+\end{array}\]
+
+Here, $\mathbf{z}_k = (z_{k_x},z_{k_y})\tr$ are our imperfect observations.  
+$x_k$ and $y_k$ represent the true state, which it is assumed our state model 
+accurately represents.  $n_{k_x}$ and $n_{k_y}$ are Gaussian variables with
+mean $0$ and variance $R_k$. 
+
+Our task is to estimate $\mathbf{x}_k$ based on the observations $\mathbf{z}_k$,
+our model of the system, knowing the variance of the state change $Q_k$, 
+our model of the observations, and the variance of our observations $R_k$.  We
+want to do this at each time step $k$, although we assume we only have the 
+information for time steps $i \le k$.  This is a very important problem in 
+many real world situations.
+
+\subsection{Generalization}
+
+We now generalize the problem described above.  Suppose that we have a state
+model
+
+\[\mathbf{x}_k = f_k(\mathbf{x}_{k-1}, \mathbf{v}_{k-1})\]
+
+where $\mathbf{x}_k, \mathbf{x}_{k-1} \in \mathbb{R}^{N_x}$ are the state
+variables at time $k$ and $k-1$, respectively, 
+$\mathbf{v}_{k-1} \in \mathbb{R}^{N_{v}}$ is 
+multivariate Gaussian noise with mean $\{\mathbf{0}\}_{\mathbb{R}^{N_v}}$ and 
+covariance $Q_k \in \mathbb{R}^{N_v} \times \mathbb{R}^{N_v}$.  Note that the 
+covariance of the noise can change with $k$.  $f_k$ can be a non-linear 
+function, and can also change at each time step $k$.
+
+Suppose we also have an observation model
+
+\[\mathbf{z}_k = h_k(\mathbf{x}_{k}, \mathbf{n}_k)\]
+where $\mathbf{z}_k \in \mathbb{R}^{N_z}$ is the observation at time step $k$, 
+$\mathbf{x}_k \in \mathbb{R}^{N_x}$ is the state at time $k$, and 
+$\mathbf{n}_k$ is multivariate Gaussian noise with mean 
+$\{\mathbf{0}\}_{\mathbb{R}^{N_n}}$ and covariance 
+$R_k \in \mathbb{R}^{N_n} \times \mathbb{R}^{N_n}$.  $h_k$ is a possibly
+non-linear function.  Both $R_k$ and $h_k$ are allowed to vary at each time
+step $k$.
+
+In this framework, our example problem becomes
+
+\[\mathbf{x}_k = f_k(\mathbf{x}_{k-1}, \mathbf{v}_{k-1}) = 
+F\mathbf{x}_{k-1} + G\mathbf{v}_{k-1}\]
+
+where $\mathbf{x}_k = (x,y,u,v)\tr$, 
+$\mathbf{v}_{k-1} = (\eta_x,\eta_y)\tr$ is a 
+multivariate Gaussian variable with mean $\{\mathbf{0}\}_{\mathbb{R}^2}$ and
+the covariance matrix $Q_k$ is
+
+\[Q_k = \begin{pmatrix} a_x^2 & 0 \\
+0 & a_y^2
+\end{pmatrix}\] 
+$F$ is a matrix where
+
+\[F = \begin{pmatrix}
+1 & 0 & \Delta t & 0 \\
+0 & 1 & 0        & \Delta t \\
+0 & 0 & 1        & 0 \\
+0 & 0 & 0        & 1
+\end{pmatrix}\]
+and $G$, also a matrix, is given by
+
+\[G = \begin{pmatrix}
+\Delta t^2 & 0 \\
+0          & \Delta t^2 \\
+\Delta t   & 0 \\
+0          & \Delta t
+\end{pmatrix}\]
+
+Our observation model becomes
+
+\[\mathbf{z}_k = h_k(\mathbf{x}_k, \mathbf{n}_k) = H\mathbf{x}_k + \mathbf{n}_k\]
+where $\mathbf{z}_k = (z_{k_x}, z_{k_y})\tr$, $\mathbf{n}_k$ is a multivariate 
+Gaussian variable with mean $\{\mathbf{0}\}_{\mathbb{R}^2}$ and 
+covariance $R_k$ (a $2 \times 2$ matrix), and $H$ is a matrix given by
+
+\[H = \begin{pmatrix}
+1 & 0 & 0 & 0 \\
+0 & 1 & 0 & 0 \\
+\end{pmatrix}\]
+
+It is clear that both our state and observation model are linear.
+
+\subsection{Prior and likelihood distributions}
+
+Now that we have these two models in place, we can use them to describe what
+in the probability literature are called the ``prior'' distribution and the
+``likelihood'' distribution.  A good deal of literature on particle filters 
+uses this vocabulary.
+
+The prior distribution is the probability density function that is conditional
+on the previous time step.  It is written as 
+$p(\mathbf{x}_k|\mathbf{x}_{k-1})$.  This function answers the question: 
+given a particular value of $\mathbf{x}_{k-1}$ in the past, what is the 
+probability of getting the input $\mathbf{x}_k$ on this time step?  
+This can be answered using our function $f_k$.  
+
+In our example, by looking at $f_k$ we can tell that since 
+$\mathbf{v}_k$ is Gaussian noise with mean $\{\mathbf{0}\}_{R^{n_v}}$ 
+and variance 
+$Q_k$, we know that $\mathbf{x}_k \sim \mathcal{N}(F\mathbf{x}_{k-1},GQ_kG\tr)$.
+This is because of the property of a multivariate normal distrubtion that if
+$Y = \mathbf{c} + BX$, where 
+$X \sim \mathcal{N}(\mathbf{\mu}, \Sigma)$, then 
+$Y \sim \mathcal{N}(c + B\mathbf{\mu},B\Sigma B\tr)$.  Therefore, we know that
+
+\[p(\mathbf{x}_k|\mathbf{x}_{k-1}) = \frac{1}{(2\pi)^{N_x/2} \det(GQ_kG\tr)^{1/2}} 
+e^{-\frac{1}{2}(\mathbf{x}_k - F\mathbf{x}_{k-1})\tr(GQ_kG\tr)^{-1}(\mathbf{x}_k
+- F\mathbf{x}_{k-1})} \]
+
+Because this is painful to write out, it is easier to write
+
+\[p(\mathbf{x}_k|\mathbf{x}_{k-1}) = \mathcal{N}(\mathbf{x}_k ; 
+F\mathbf{x}_{k-1}, GQ_kG\tr)\]
+
+Here, $\mathbf{x}_k$ is the argument to the pdf of the distribution, 
+$F\mathbf{x}_{k-1}$ is the mean, and $GQ_kG\tr$ is the covariance matrix.
+
+The final probability density function we need is the likelihood function.  This
+is written as $p(\mathbf{z}_{k} | \mathbf{x}_k)$, and it answers the question:
+given that the state is $\mathbf{x}_k$, how likely is the observation
+$\mathbf{z}_k$?  We can use $h_k$ to answer this question.
+
+In our example, again we can see from the same argument for $\mathbf{x}_k$
+that $\mathbf{z}_k \sim \mathcal{N}(H\mathbf{x_k}, R_k)$.  Thus, we can write
+
+\[p(\mathbf{z}_k|\mathbf{x}_k) = \mathcal{N}(\mathbf{z}_k ; H\mathbf{x}_{k}, R_k)\]
+
+Being able to switch back and forth between the SDE and probability frameworks
+will prove very beneficial when reading the literature.  It is worth noting
+that in this framework, the problem of determining state from noisy observations
+is often stated as trying to find the conditional PDF
+
+\[p(\mathbf{\hat{x}}_k|\mathbf{z}_{1,\ldots,k})\]
+where $\mathbf{\hat{x}}_k$ is the estimate of the true state $\mathbf{x}_k$ and 
+$\mathbf{z}_{1,\ldots,k}$ are the observations up to time $k$.
+
+\section{Kalman Filter variants}
+
+We now begin by discussing the Kalman filter.  If the state and observation 
+models are linear, as in our example, and the noise is Gaussian, the predicted
+state $\mathbf{\hat{x}}_k$ given the observations will be Gaussian as well.
+The Kalman filter is the optimal predictor of state if the state and 
+observation model are linear, and it also optimally estimates the 
+covariance of the prediction.  The derivation will not be presented here; it 
+can be found in many other places such as Wikipedia and other papers.
+
+The algorithm is presented in the following Matlab code:
+
+\lstinputlisting{kalman.m}
+
+The main point is that the Kalman filter makes a prediction of the state
+$m_{k|k-1}$ and covariance $P_{k|k-1}$, then uses this prediction to update
+and find the optimal prediction $m_{k|k}$ and the covariance $P_{k|k}$.
+
+\subsection{Extended Kalman Filter}
+
+If the model is not linear, the derivative of the state model is a linear 
+approximation of $f_k$ near the predicted point 
+
+\[ F_k = \left.\frac{df_k}{d\mathbf{x}}(\mathbf{x})\right|_{\mathbf{x} = m_{k-1|k-1}} \]
+
+Likewise, the derivative of the observation model is a linear approximation
+of $h_k$ near the point $\mathbf{x}_k$.
+
+\[ H_k = \left.\frac{dh_k}{d\mathbf{x}}(\mathbf{x})\right|_{\mathbf{x} = m_{k|k-1}} \]
+
+These approximations can be used with the Kalman filter for a nonlinear 
+model, but because the predicted state need not be Gaussian, the extended
+Kalman filter is no longer considered optimal in anyway.
+
+\section{Particle filter variants}
+
+Particle filters attempt to estimate the state of a model by running the same
+system many times with different paths chosen based on the statistics of the
+system.  Each particle has an associated weight, $W$, that tells how likely the 
+individual particle is.  The particles must be resampled as they have a
+tendancy to become degenerate after a few steps of the model.
+
+The resampling algorithm is shown in the following Matlab code:
+
+\lstinputlisting{resample.m}
+
+The main idea is that we sample a $\theta_k \sim U(0,1)$ and then we pick
+$\mathbf{x}_k^* = \mathbf{x}_n$ so that
+
+\[A^{-1} \sum_{j=1}^{n}W_j < \theta_k \le A^{-1}\sum_{j=1}^{n+1} W_j\]
+where $A = \sum_{j=1}^{Ns} W_j$.
+
+\subsection{Sampling Importance Resampling Filter}
+
+The code for the sampling importance resampling filter is shown below
+
+\lstinputlisting{particleSir.m}
+
+\subsection{Auxilary Sampling Importance Resampling Filter}
+
+The code for the auxilary sampling importance resampling filter is shown
+below
+
+\lstinputlisting{particleAsir.m}
+
+\end{document}

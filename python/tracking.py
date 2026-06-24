@@ -91,7 +91,7 @@ class TargetSimulation:
         self.model = model
         self.n_steps = n_steps
 
-    def generate_telemetry(self, initial_state: FloatArray) -> Tuple[FloatArray, FloatArray]:
+    def brownian_generate_telemetry(self, initial_state: FloatArray) -> Tuple[FloatArray, FloatArray]:
         """
         Generates the continuous true states and the corresponding sensor measurements.
         
@@ -120,6 +120,47 @@ class TargetSimulation:
             )
             measurements[:, step] = self.model.observation_model @ true_states[:, step] + sensor_noise
             
+        return true_states, measurements
+
+    def generate_telemetry(self, initial_state: FloatArray) -> Tuple[FloatArray, FloatArray]:
+        true_states = np.zeros((self.model.state_dim, self.n_steps))
+        measurements = np.zeros((self.model.obs_dim, self.n_steps))
+
+        current_state = initial_state.copy()
+        true_states[:, 0] = current_state
+
+        # Initialize a random maneuver timer
+        maneuver_timer = 0
+
+        for step in range(self.n_steps):
+            if step > 0:
+                maneuver_timer -= 1
+                
+                # If the timer expires, pick a new random acceleration and a new hold time
+                if maneuver_timer <= 0:
+                    # Random acceleration between -15 and 15
+                    current_state[4] = np.random.uniform(-15.0, 15.0) 
+                    current_state[5] = np.random.uniform(-15.0, 15.0)
+                    # Hold this turn for anywhere between 0.5 to 2.5 seconds (10 to 50 steps)
+                    maneuver_timer = np.random.randint(5, 10)
+
+                # Propagate the state forward
+                current_state = self.model.state_transition @ current_state
+                
+                # Inject a tiny amount of true process noise just to keep it slightly gritty
+                process_noise = np.random.multivariate_normal(
+                    np.zeros(self.model.state_dim), self.model.process_covariance
+                )
+                current_state += process_noise
+
+                true_states[:, step] = current_state
+
+            # Generate noisy measurement
+            sensor_noise = np.random.multivariate_normal(
+                np.zeros(self.model.obs_dim), self.model.sensor_covariance
+            )
+            measurements[:, step] = self.model.observation_model @ true_states[:, step] + sensor_noise
+
         return true_states, measurements
 
 
@@ -578,12 +619,41 @@ class WeakConstraint4DVarSmoother(BaseTrackingFilter):
                 opt_x_traj[:, k+1] = self.model.state_transition @ opt_x_traj[:, k] + w_k
             
             estimated_states[:, start_idx:end_idx] = opt_x_traj
-            
-            # Note: In Weak-Constraint 4DVar, calculating the exact posterior covariance requires 
-            # inverting the massive Hessian of the expanded control space. For visual tracking, 
-            # we inject the baseline process covariance to keep the visualization loop happy.
+           
+            # --- Exact Analytical Covariance Calculation ---
+            # 1. Build the base Hessian for the 90-dimensional control vector (u)
+            hessian = np.zeros((ctrl_dim, ctrl_dim))
+            hessian[0:self.model.state_dim, 0:self.model.state_dim] = b_inv
+            for i in range(w_steps - 1):
+                idx = self.model.state_dim * (i + 1)
+                hessian[idx:idx+self.model.state_dim, idx:idx+self.model.state_dim] = q_inv
+
+            # 2. Add the observation penalties to the Hessian
+            m_matrices = []
             for k in range(w_steps):
-                estimate_covariances[:, :, start_idx + k] = self.model.process_covariance
+                # M_k is the kinematic transformation matrix that maps the control vector 
+                # (initial state + noise sequence) into the state at time k: X_k = M_k @ u
+                m_k = np.zeros((self.model.state_dim, ctrl_dim))
+                m_k[:, 0:self.model.state_dim] = np.linalg.matrix_power(self.model.state_transition, k)
+                for j in range(k):
+                    idx = self.model.state_dim * (j + 1)
+                    m_k[:, idx:idx+self.model.state_dim] = np.linalg.matrix_power(self.model.state_transition, k - 1 - j)
+                
+                # Accumulate H^T * R^-1 * H into the Hessian
+                h_mk = self.model.observation_model @ m_k
+                hessian += h_mk.T @ r_inv @ h_mk
+                m_matrices.append(m_k)
+                
+            # 3. Invert the 90x90 Hessian to get the exact covariance of the control vector
+            # (Adding a microscopic epsilon to the diagonal ensures numerical stability)
+            inv_hessian = np.linalg.inv(hessian + np.eye(ctrl_dim) * 1e-12)
+            
+            # 4. Map the control covariance back into the 6D state space for each time step
+            for k in range(w_steps):
+                # Cov(X_k) = M_k * Cov(u) * M_k^T
+                step_cov = m_matrices[k] @ inv_hessian @ m_matrices[k].T
+                # Force symmetry to prevent np.linalg.eigh from throwing errors
+                estimate_covariances[:, :, start_idx + k] = (step_cov + step_cov.T) / 2.0
             
             if end_idx < n_steps:
                 current_x_b = opt_x_traj[:, -1]
@@ -648,7 +718,7 @@ class AlphaBetaGammaFilter(BaseTrackingFilter):
         # ABG requires tracking acceleration, so we internally use a 6D state:
         # [x, y, vx, vy, ax, ay]
         internal_states = np.zeros((6, n_steps))
-        internal_states[0:4, 0] = initial_state
+        internal_states[:, 0] = initial_state
         
         # Heuristic tuning parameters (These dictate the "stiffness" of the filter)
         alpha = 0.1     # Position trust
@@ -682,7 +752,7 @@ class AlphaBetaGammaFilter(BaseTrackingFilter):
             internal_states[5, step] = pred_ay + (2 * gamma / (dt**2)) * res_y
 
         # Slice the output to match the 4D [x, y, vx, vy] expectation of your visualizer
-        estimated_states = internal_states[0:4, :]
+        estimated_states = internal_states
         
         # ABG does not calculate uncertainty covariance. We generate static 
         # placeholder matrices so the plotting function's ellipse math doesn't crash.
@@ -832,33 +902,52 @@ def main():
                         help="Animation frame skip interval for rendering speed.")
     parser.add_argument("--pause-factor", type=float, default=3.0,
                         help="Multiplier for the animation pause time (e.g., 5 = 0.05s pause).")
+    parser.add_argument("--obs-stddev", type=float, default=10.0,
+                        help="Standard deviation of the simulated sensor scatter (R matrix).")
     parser.add_argument("--run-bridge", action="store_true", 
                         help="Execute the standalone Brownian Bridge SDE solver.")
     args = parser.parse_args()
 
     logger.info("Defining System Physics and Sensor Configuration Data Model...")
     time_step = 0.05
-    obs_variance = 0.05
-    dt2 = 0.5 * time_step**2
+    obs_variance = args.obs_stddev**2
+    
+    # Precompute kinematic scalars
+    dt = time_step
+    dt2 = 0.5 * dt**2
+
+    # G maps the 2D acceleration noise (jerk) into the 6D state space
+    G = np.array([
+        [dt2, 0.0],
+        [0.0, dt2],
+        [dt,  0.0],
+        [0.0, dt ],
+        [1.0, 0.0],
+        [0.0, 1.0]
+    ])
+    
+    # Filter's belief about the variance of the random acceleration changes
+    Q_continuous = np.array([
+        [50.0, 0.0], 
+        [0.0, 50.0]
+    ])
 
     model_config = StateSpaceModel(
         state_transition=np.array([
-            [1.0, 0.0, time_step, 0.0],
-            [0.0, 1.0, 0.0,       time_step],
-            [0.0, 0.0, 1.0,       0.0],
-            [0.0, 0.0, 0.0,       1.0]
+            [1.0, 0.0, dt,  0.0, dt2, 0.0],
+            [0.0, 1.0, 0.0, dt,  0.0, dt2],
+            [0.0, 0.0, 1.0, 0.0, dt,  0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0, dt ],
+            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
         ]),
         observation_model=np.array([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0]
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         ]),
-        process_covariance=(
-            np.array([[dt2, 0.0], [0.0, dt2], [time_step, 0.0], [0.0, time_step]]) @ 
-            np.array([[0.5, 0.01], [0.01, 0.5]]) @ 
-            np.array([[dt2, 0.0], [0.0, dt2], [time_step, 0.0], [0.0, time_step]]).T
-        ),
+        process_covariance=(G @ Q_continuous @ G.T),
         sensor_covariance=np.array([
-            [obs_variance, 0.0], 
+            [obs_variance, 0.0],
             [0.0,          obs_variance]
         ])
     )
@@ -872,8 +961,7 @@ def main():
     vis = FilterVisualizer(frame_skip=args.frame_skip, pause_time=calc_pause)
 
     # Determine which filters to run
-    # filters_to_run = ['kalman', 'sir', 'asir', '4dvar', 'rts'] if args.filter == 'all' else [args.filter]
-    filters_to_run = ['abg'] if args.filter == 'all' else [args.filter]
+    filters_to_run = ['kalman', 'asir', 'wc4dvar', 'rts'] if args.filter == 'all' else [args.filter]
 
     for f_type in filters_to_run:
         logger.info(f"Instantiating and executing the {f_type.upper()} Filter...")
